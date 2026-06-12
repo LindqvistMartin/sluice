@@ -1,0 +1,31 @@
+# Only go.{mod,sum} and the Go packages need to reach the build context. Anything
+# below either must never land in the image or only bloats the context.
+
+# VCS
+.git/
+.gitignore
+.gitattributes
+
+# Project meta — not needed to build the binary
+*.md
+docs/
+.github/
+
+# IDE / editor
+.idea/
+.vscode/
+.vs/
+*.swp
+
+# Runtime artifacts and local config
+dlq.db
+dlq.db-wal
+dlq.db-shm
+.env
+.env.local
+
+# Build output
+bin/
+dist/
+sluice
+sluice.exe
