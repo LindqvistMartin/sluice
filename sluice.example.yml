@@ -1,0 +1,30 @@
+# Sluice configuration — v0.1 contract.
+# Copy to sluice.yml and edit. Validate with: sluice -t -c sluice.yml
+
+listen: :8080
+
+limits:
+  max_body_bytes: 1048576        # 1 MiB
+  per_ip_rate: 100/min           # burst equals the per-minute rate
+
+dlq:
+  path: ./dlq.db
+  max_size_mb: 100               # logical size; oldest rows are evicted first
+
+routes:
+  - path: /prometheus
+    fanout:
+      - url: http://flare:8080/api/v1/webhooks/prometheus
+        timeout: 10s
+        retry: { max: 5, backoff: exponential }   # full jitter is always applied; there is no jitter key
+      - url: https://hooks.slack.com/services/XXX
+        timeout: 5s
+        retry: { max: 3, backoff: exponential }
+
+  - path: /github
+    match:
+      header:
+        X-GitHub-Event: workflow_run
+    fanout:
+      - url: http://flare:8080/api/v1/webhooks/github
+        timeout: 10s
