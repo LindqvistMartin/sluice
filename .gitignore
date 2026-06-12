@@ -1,0 +1,30 @@
+# Binaries
+/sluice
+/sluice.exe
+bin/
+dist/
+
+# SQLite DLQ (runtime artifact)
+dlq.db
+dlq.db-wal
+dlq.db-shm
+
+# IDE
+.idea/
+.vscode/
+.vs/
+*.swp
+*.swo
+
+# Env / secrets
+.env
+.env.local
+
+# OS
+.DS_Store
+Thumbs.db
+ehthumbs.db
+
+# Logs
+*.log
+logs/
