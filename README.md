@@ -1,14 +1,33 @@
 # Sluice
 
 Inbound webhook fan-out for self-hosted incident stacks.
-One binary. Persistent DLQ. No SaaS.
+One binary, persistent DLQ.
 
 [![CI](https://github.com/LindqvistMartin/sluice/actions/workflows/ci.yml/badge.svg)](https://github.com/LindqvistMartin/sluice/actions)
 [![Go](https://img.shields.io/badge/Go-1.26-00add8.svg)](https://go.dev)
 [![MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
+> A small self-hosted SRE stack, built to chain: **pulsewatch** to detect, **sluice** to route webhooks, **flare** to run the incident.
+
 > Early development — a small daemon I built while running my Flare instance.
 > Configuration and interfaces are not stable yet.
+
+## Why
+
+Most incident tools expose one inbound webhook URL. Once a second system needs to reach it, you either run a queue in front or start dropping events when a target is down. Sluice is that queue. It takes webhooks in, writes them to a local store before acknowledging, and fans them out to every configured target, retrying the ones that fail.
+
+## What works today
+
+- One endpoint in, matched by path and headers
+- Per-IP rate limiting and body-size caps in front of it
+- Structured logging, config-as-code, and a `-t` config check
+
+## Planned
+
+- Persist every accepted event to a local SQLite DLQ before acknowledging it
+- Fan out to many targets, each with its own retries and backoff
+
+One small static binary in a ~15 MB image, with no message broker to run alongside it. Design notes are in the [ADRs](docs/adr).
 
 ## License
 
