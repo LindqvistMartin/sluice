@@ -1,2 +1,2 @@
-// Package observability wires structured logging and Prometheus metrics.
+// Package observability wires structured logging for the daemon.
 package observability
