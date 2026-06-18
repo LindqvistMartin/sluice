@@ -1,0 +1,4 @@
+routes:
+  - path: /hook
+    fanout:
+      - url: http://example.com/in

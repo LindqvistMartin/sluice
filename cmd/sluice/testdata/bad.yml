@@ -1,0 +1,4 @@
+routes:
+  - path: /a
+    fanout:
+      - url: ftp://nope
