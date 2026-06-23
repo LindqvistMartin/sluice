@@ -1,6 +1,8 @@
 package ingest
 
 import (
+	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -142,5 +144,53 @@ func TestClientIP(t *testing.T) {
 		if got := clientIP(&http.Request{RemoteAddr: tt.remote}); got != tt.want {
 			t.Errorf("clientIP(%q) = %q, want %q", tt.remote, got, tt.want)
 		}
+	}
+}
+
+type stubPersister struct {
+	err        error
+	gotTargets int
+}
+
+func (s *stubPersister) Persist(_ context.Context, ev Event) error {
+	s.gotTargets = len(ev.Targets)
+	return s.err
+}
+
+func persistHandler(p Persister) *Handler {
+	return New(Options{
+		Matcher: route.New(&config.Config{Routes: []config.Route{
+			{Path: "/hook", Fanout: []config.Target{{URL: "http://a"}, {URL: "http://b"}}},
+		}}),
+		Limiter:      NewIPLimiter(generousRate(), time.Minute),
+		Persister:    p,
+		MaxBodyBytes: 1 << 20,
+	})
+}
+
+func TestHandler_Persisted200(t *testing.T) {
+	p := &stubPersister{}
+	srv := httptest.NewServer(persistHandler(p))
+	defer srv.Close()
+
+	if code := post(t, srv.URL+"/hook", "x"); code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", code)
+	}
+	if p.gotTargets != 2 {
+		t.Errorf("persister saw %d targets, want 2 (the route fan-out must reach the event)", p.gotTargets)
+	}
+}
+
+func TestHandler_PersistError503(t *testing.T) {
+	srv := httptest.NewServer(persistHandler(&stubPersister{err: errors.New("disk full")}))
+	defer srv.Close()
+
+	resp := postResp(t, srv.URL+"/hook", "x")
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Retry-After"); got != "1" {
+		t.Errorf("Retry-After = %q, want 1", got)
 	}
 }

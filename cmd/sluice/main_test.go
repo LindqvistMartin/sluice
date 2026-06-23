@@ -3,8 +3,18 @@ package main
 import (
 	"bytes"
 	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/LindqvistMartin/sluice/internal/config"
+	"github.com/LindqvistMartin/sluice/internal/deliver"
+	"github.com/LindqvistMartin/sluice/internal/dlq"
+	"github.com/LindqvistMartin/sluice/internal/ingest"
 )
 
 func TestRun_Version(t *testing.T) {
@@ -69,5 +79,73 @@ func TestRun_VersionBeforeLogFormat(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "sluice ") {
 		t.Errorf("version output = %q", out.String())
+	}
+}
+
+// TestCoordinator_PersistAndFanOut exercises the composition-root glue end to end:
+// an event is persisted and every target receives the body and a shared event id.
+// It pins the positional contract between the store's returned delivery ids and the
+// event's targets, which nothing else covers.
+func TestCoordinator_PersistAndFanOut(t *testing.T) {
+	body := []byte(`{"alert":"firing"}`)
+
+	type received struct {
+		body    string
+		eventID string
+	}
+	got := make(chan received, 2)
+	newTarget := func() *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			b, _ := io.ReadAll(r.Body)
+			got <- received{body: string(b), eventID: r.Header.Get("X-Sluice-Event-Id")}
+			w.WriteHeader(http.StatusOK)
+		}))
+	}
+	t1, t2 := newTarget(), newTarget()
+	defer t1.Close()
+	defer t2.Close()
+
+	store, err := dlq.Open(filepath.Join(t.TempDir(), "dlq.db"), nil)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() { _ = store.Close(context.Background()) }()
+
+	pool := deliver.NewPool(deliver.PoolConfig{Workers: 2, Reporter: store})
+	pool.Start()
+	defer pool.Close()
+
+	coord := &coordinator{store: store, pool: pool}
+	ev := ingest.Event{
+		Route:   "/hook",
+		Headers: http.Header{"Content-Type": {"application/json"}},
+		Body:    body,
+		Targets: []config.Target{
+			{URL: t1.URL, Timeout: config.Duration{Duration: 2 * time.Second}, Retry: config.Retry{Max: 3}},
+			{URL: t2.URL, Timeout: config.Duration{Duration: 2 * time.Second}, Retry: config.Retry{Max: 3}},
+		},
+	}
+	if err := coord.Persist(context.Background(), ev); err != nil {
+		t.Fatalf("persist: %v", err)
+	}
+
+	timeout := time.After(5 * time.Second)
+	var eventIDs []string
+	for range 2 {
+		select {
+		case r := <-got:
+			if r.body != string(body) {
+				t.Errorf("target body = %q, want %q", r.body, body)
+			}
+			if r.eventID == "" {
+				t.Error("target received empty X-Sluice-Event-Id")
+			}
+			eventIDs = append(eventIDs, r.eventID)
+		case <-timeout:
+			t.Fatal("timed out waiting for fan-out")
+		}
+	}
+	if eventIDs[0] != eventIDs[1] {
+		t.Errorf("targets saw different event ids: %q vs %q", eventIDs[0], eventIDs[1])
 	}
 }

@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/LindqvistMartin/sluice/internal/config"
+	"github.com/LindqvistMartin/sluice/internal/deliver"
+	"github.com/LindqvistMartin/sluice/internal/dlq"
 	"github.com/LindqvistMartin/sluice/internal/ingest"
 	"github.com/LindqvistMartin/sluice/internal/observability"
 	"github.com/LindqvistMartin/sluice/internal/route"
@@ -76,9 +78,32 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 
 	matcher := route.New(cfg)
 	limiter := ingest.NewIPLimiter(cfg.Limits.Rate(), limiterTTL)
+
+	store, err := dlq.Open(cfg.DLQ.Path, log)
+	if err != nil {
+		return fmt.Errorf("open dlq: %w", err)
+	}
+	// Drain order on shutdown: srv.Shutdown (below) stops accepting and waits for
+	// in-flight handlers to return BEFORE these defers run, so nothing is mid-Persist
+	// or mid-Submit when the pipeline closes — keep srv.Shutdown out of the defer
+	// chain or that guarantee is lost. Among the defers, LIFO runs pool.Close before
+	// store.Close, so workers finish reporting into the store before its writer stops
+	// and the WAL is checkpointed.
+	defer func() { _ = store.Close(context.Background()) }()
+
+	pool := deliver.NewPool(deliver.PoolConfig{
+		Client:   deliver.NewClient(),
+		Reporter: store,
+		Logger:   log,
+	})
+	pool.Start()
+	defer pool.Close()
+
+	coord := &coordinator{store: store, pool: pool}
 	handler := ingest.New(ingest.Options{
 		Matcher:      matcher,
 		Limiter:      limiter,
+		Persister:    coord,
 		MaxBodyBytes: cfg.Limits.MaxBodyBytes,
 		Logger:       log,
 	})
@@ -124,9 +149,9 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		log.Info("shutdown signal received, draining")
 	}
 
-	// The drain order grows as the pipeline lands: after the server stops
-	// accepting, stop the replay worker, drain in-flight deliveries, then close the
-	// DLQ writer and checkpoint the WAL. For now it is the server then the limiter.
+	// Stop accepting first; the deferred pool and store closes then drain in-flight
+	// deliveries and checkpoint the WAL. A replay-worker stop will slot in ahead of
+	// the pool drain once that worker exists.
 	shutdownCtx, scancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer scancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil {
@@ -136,3 +161,47 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	log.Info("sluice stopped")
 	return nil
 }
+
+// coordinator persists each accepted event durably, then hands one delivery per
+// target to the pool. It is the composition root's glue between the store and the
+// pool — the only type that depends on both — and it satisfies ingest.Persister.
+type coordinator struct {
+	store *dlq.Store
+	pool  *deliver.Pool
+}
+
+// Persist commits the event and its deliveries, then fans them out. It returns nil
+// only once the write is durable, which is what lets the handler answer 200.
+func (c *coordinator) Persist(ctx context.Context, ev ingest.Event) error {
+	urls := make([]string, len(ev.Targets))
+	for i, t := range ev.Targets {
+		urls[i] = t.URL
+	}
+
+	res, err := c.store.Persist(ctx, dlq.EventRecord{
+		Route:      ev.Route,
+		Headers:    ev.Headers,
+		Body:       ev.Body,
+		TargetURLs: urls,
+	})
+	if err != nil {
+		return fmt.Errorf("persist event: %w", err)
+	}
+
+	for i, t := range ev.Targets {
+		c.pool.Submit(deliver.Delivery{
+			DeliveryID: res.DeliveryIDs[i],
+			EventID:    res.EventID,
+			TargetURL:  t.URL,
+			Body:       ev.Body,
+			Headers:    ev.Headers,
+			Timeout:    t.Timeout.Duration,
+			RetryMax:   t.Retry.Max,
+		})
+	}
+	return nil
+}
+
+// The pool consumes the store as a deliver.Reporter; this assertion pins that the
+// store keeps satisfying the interface without importing deliver.
+var _ deliver.Reporter = (*dlq.Store)(nil)

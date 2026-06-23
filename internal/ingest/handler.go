@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 
+	"github.com/LindqvistMartin/sluice/internal/config"
 	"github.com/LindqvistMartin/sluice/internal/route"
 )
 
@@ -24,6 +25,7 @@ type Event struct {
 	Route   string
 	Headers http.Header
 	Body    []byte
+	Targets []config.Target
 }
 
 // Handler accepts inbound webhooks: it rate-limits by client IP, matches a route,
@@ -104,9 +106,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// r.Header is owned by the server and may be reused after this returns; a
-	// persister that runs Persist on another goroutine must copy what it keeps.
-	ev := Event{Route: matched.Path, Headers: r.Header, Body: body}
+	// r.Header is owned by the server and reused after this returns, and the body
+	// fans out on goroutines that outlive the request, so clone the headers here.
+	// matched.Fanout is process-lifetime config and needs no copy.
+	ev := Event{Route: matched.Path, Headers: r.Header.Clone(), Body: body, Targets: matched.Fanout}
 	if err := h.persister.Persist(r.Context(), ev); err != nil {
 		h.log.Error("persist failed", "route", matched.Path, "err", err)
 		w.Header().Set("Retry-After", retryAfter)
