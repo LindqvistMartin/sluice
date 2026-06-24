@@ -78,9 +78,14 @@ func (c *Config) validate() error {
 		if len(r.Fanout) == 0 {
 			add(rp+".fanout", "must list at least one target")
 		}
+		seenURL := make(map[string]bool)
 		for j, t := range r.Fanout {
 			tp := fmt.Sprintf("%s.fanout[%d]", rp, j)
 			validateURL(tp+".url", t.URL, add)
+			if t.URL != "" && seenURL[t.URL] {
+				add(tp+".url", fmt.Sprintf("duplicate target url %q in fanout", t.URL))
+			}
+			seenURL[t.URL] = true
 			if t.Timeout.Duration <= 0 {
 				add(tp+".timeout", "must be greater than 0")
 			}

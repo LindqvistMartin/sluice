@@ -3,11 +3,13 @@ package main
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -15,6 +17,7 @@ import (
 	"github.com/LindqvistMartin/sluice/internal/deliver"
 	"github.com/LindqvistMartin/sluice/internal/dlq"
 	"github.com/LindqvistMartin/sluice/internal/ingest"
+	"github.com/LindqvistMartin/sluice/internal/replay"
 )
 
 func TestRun_Version(t *testing.T) {
@@ -82,54 +85,85 @@ func TestRun_VersionBeforeLogFormat(t *testing.T) {
 	}
 }
 
-// TestCoordinator_PersistAndFanOut exercises the composition-root glue end to end:
-// an event is persisted and every target receives the body and a shared event id.
-// It pins the positional contract between the store's returned delivery ids and the
-// event's targets, which nothing else covers.
-func TestCoordinator_PersistAndFanOut(t *testing.T) {
+// TestPipeline_PersistThenReplayDelivers exercises the whole durable pipeline end to
+// end: the coordinator persists and nudges, the replay worker claims and submits, and
+// the pool delivers — including a target that fails once and succeeds on the
+// rescheduled pass. A fully delivered event drains both tables to empty.
+func TestPipeline_PersistThenReplayDelivers(t *testing.T) {
 	body := []byte(`{"alert":"firing"}`)
 
 	type received struct {
 		body    string
 		eventID string
 	}
-	got := make(chan received, 2)
-	newTarget := func() *httptest.Server {
-		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			b, _ := io.ReadAll(r.Body)
-			got <- received{body: string(b), eventID: r.Header.Get("X-Sluice-Event-Id")}
-			w.WriteHeader(http.StatusOK)
-		}))
-	}
-	t1, t2 := newTarget(), newTarget()
-	defer t1.Close()
-	defer t2.Close()
+	got := make(chan received, 8)
 
-	store, err := dlq.Open(filepath.Join(t.TempDir(), "dlq.db"), nil)
+	okTarget := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		got <- received{body: string(b), eventID: r.Header.Get("X-Sluice-Event-Id")}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer okTarget.Close()
+
+	// Fails once, then succeeds: exercises reschedule-then-deliver across passes.
+	var flakyHits atomic.Int32
+	flakyTarget := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if flakyHits.Add(1) == 1 {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		b, _ := io.ReadAll(r.Body)
+		got <- received{body: string(b), eventID: r.Header.Get("X-Sluice-Event-Id")}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer flakyTarget.Close()
+
+	dbPath := filepath.Join(t.TempDir(), "dlq.db")
+	store, err := dlq.Open(dbPath, nil)
 	if err != nil {
 		t.Fatalf("open store: %v", err)
 	}
 	defer func() { _ = store.Close(context.Background()) }()
 
-	pool := deliver.NewPool(deliver.PoolConfig{Workers: 2, Reporter: store})
+	pool := deliver.NewPool(deliver.PoolConfig{
+		Workers:     2,
+		Reporter:    store,
+		BackoffBase: time.Millisecond,
+		BackoffCap:  5 * time.Millisecond,
+	})
 	pool.Start()
 	defer pool.Close()
 
-	coord := &coordinator{store: store, pool: pool}
+	cfg := &config.Config{Routes: []config.Route{{
+		Path: "/hook",
+		Fanout: []config.Target{
+			{URL: okTarget.URL, Timeout: config.Duration{Duration: 2 * time.Second}, Retry: config.Retry{Max: 3}},
+			{URL: flakyTarget.URL, Timeout: config.Duration{Duration: 2 * time.Second}, Retry: config.Retry{Max: 3}},
+		},
+	}}}
+
+	wake := make(chan struct{}, 1)
+	worker := replay.New(store, pool, replay.Config{
+		Interval: 20 * time.Millisecond,
+		LeaseTTL: time.Minute,
+		Wake:     wake,
+		Resolver: newTargetResolver(cfg),
+	})
+	worker.Start()
+	defer worker.Stop()
+
+	coord := &coordinator{store: store, wake: wake}
 	ev := ingest.Event{
 		Route:   "/hook",
 		Headers: http.Header{"Content-Type": {"application/json"}},
 		Body:    body,
-		Targets: []config.Target{
-			{URL: t1.URL, Timeout: config.Duration{Duration: 2 * time.Second}, Retry: config.Retry{Max: 3}},
-			{URL: t2.URL, Timeout: config.Duration{Duration: 2 * time.Second}, Retry: config.Retry{Max: 3}},
-		},
+		Targets: cfg.Routes[0].Fanout,
 	}
 	if err := coord.Persist(context.Background(), ev); err != nil {
 		t.Fatalf("persist: %v", err)
 	}
 
-	timeout := time.After(5 * time.Second)
+	timeout := time.After(10 * time.Second)
 	var eventIDs []string
 	for range 2 {
 		select {
@@ -142,10 +176,40 @@ func TestCoordinator_PersistAndFanOut(t *testing.T) {
 			}
 			eventIDs = append(eventIDs, r.eventID)
 		case <-timeout:
-			t.Fatal("timed out waiting for fan-out")
+			t.Fatal("timed out waiting for delivery")
 		}
 	}
 	if eventIDs[0] != eventIDs[1] {
 		t.Errorf("targets saw different event ids: %q vs %q", eventIDs[0], eventIDs[1])
 	}
+
+	// Both targets delivered (the flaky one after a reschedule), so the store drains to
+	// empty: a fully delivered event leaves nothing behind.
+	deadline := time.After(10 * time.Second)
+	for countDeliveries(t, dbPath) != 0 {
+		select {
+		case <-deadline:
+			t.Fatal("deliveries did not drain to 0")
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	if got := flakyHits.Load(); got != 2 {
+		t.Errorf("flaky target hit %d times, want 2 (one 500, one 200)", got)
+	}
+}
+
+// countDeliveries counts delivery rows over an independent read-only connection.
+func countDeliveries(t *testing.T, path string) int {
+	t.Helper()
+	db, err := sql.Open("sqlite", path+"?_pragma=busy_timeout(5000)")
+	if err != nil {
+		t.Fatalf("open read db: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	var n int
+	if err := db.QueryRow("SELECT COUNT(*) FROM deliveries").Scan(&n); err != nil {
+		t.Fatalf("count deliveries: %v", err)
+	}
+	return n
 }

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -16,9 +17,12 @@ import (
 )
 
 // schemaDDL is the durable store: events holds each payload once, deliveries holds
-// one row per target with a foreign key that cascades on delete. The full column
-// set is created up front so later schema needs no migration; this iteration only
-// ever writes status='pending' and never leases.
+// one row per target with a foreign key that cascades on delete. A row is 'pending'
+// until it is leased and driven to a terminal state — deleted on success, or 'dead'
+// once its retry budget is exhausted. lease_until keeps an in-flight row from being
+// claimed twice and lets a crashed worker's row recover once the lease expires;
+// next_attempt_at schedules the next due time. The full column set was created up
+// front so this needs no migration.
 const schemaDDL = `
 CREATE TABLE IF NOT EXISTS events (
     id           TEXT    PRIMARY KEY,
@@ -67,6 +71,19 @@ type EventRecord struct {
 type PersistResult struct {
 	EventID     string
 	DeliveryIDs []int64
+}
+
+// Claimed is a leased delivery returned by ClaimDue. It carries everything the
+// delivery pool needs to attempt the target except the per-target Timeout and
+// RetryMax, which live in config and the caller resolves by Route and TargetURL.
+type Claimed struct {
+	DeliveryID int64
+	EventID    string
+	Route      string
+	TargetURL  string
+	Headers    http.Header
+	Body       []byte
+	Attempts   int // attempts already recorded before this lease
 }
 
 // Store is the SQLite-backed durable queue. All writes go through a single
@@ -197,9 +214,90 @@ func (s *Store) Persist(ctx context.Context, rec EventRecord) (PersistResult, er
 	return res, err
 }
 
+// ClaimDue atomically leases up to limit deliveries that are pending, due
+// (next_attempt_at <= now), and not already under a live lease (lease_until <= now),
+// returning each joined to its event's body and headers. The select-then-lease runs
+// in one transaction on the single write connection, so two concurrent callers
+// cannot claim the same row: the writer goroutine serializes closures, and a row the
+// first call leased is excluded from the second by its advanced lease_until. now and
+// leaseTTL are supplied by the caller so the worker and tests control time directly.
+func (s *Store) ClaimDue(ctx context.Context, now int64, leaseTTL time.Duration, limit int) ([]Claimed, error) {
+	var claimed []Claimed
+	err := s.do(ctx, func(ctx context.Context, db *sql.DB) error {
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("begin: %w", err)
+		}
+		defer func() { _ = tx.Rollback() }()
+
+		rows, err := tx.QueryContext(ctx,
+			`SELECT d.id, d.event_id, e.route, d.target_url, e.headers_json, e.body, d.attempts
+			 FROM deliveries d JOIN events e ON e.id = d.event_id
+			 WHERE d.status = 'pending' AND d.next_attempt_at <= ? AND d.lease_until <= ?
+			 ORDER BY d.next_attempt_at ASC LIMIT ?`,
+			now, now, limit)
+		if err != nil {
+			return fmt.Errorf("select due: %w", err)
+		}
+
+		var batch []Claimed
+		for rows.Next() {
+			var (
+				c           Claimed
+				headersJSON []byte
+			)
+			if err := rows.Scan(&c.DeliveryID, &c.EventID, &c.Route, &c.TargetURL, &headersJSON, &c.Body, &c.Attempts); err != nil {
+				_ = rows.Close()
+				return fmt.Errorf("scan due: %w", err)
+			}
+			if err := json.Unmarshal(headersJSON, &c.Headers); err != nil {
+				_ = rows.Close()
+				return fmt.Errorf("unmarshal headers: %w", err)
+			}
+			batch = append(batch, c)
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("iterate due: %w", err)
+		}
+		// The result set must be fully closed before the UPDATE runs: the store holds a
+		// single connection, and a query in progress would block the next statement.
+		if err := rows.Close(); err != nil {
+			return fmt.Errorf("close due: %w", err)
+		}
+
+		if len(batch) == 0 {
+			return tx.Commit()
+		}
+
+		args := make([]any, 0, len(batch)+2)
+		args = append(args, now+leaseTTL.Milliseconds())
+		placeholders := make([]string, len(batch))
+		for i := range batch {
+			placeholders[i] = "?"
+			args = append(args, batch[i].DeliveryID)
+		}
+		args = append(args, now)
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE deliveries SET lease_until = ? WHERE id IN (`+strings.Join(placeholders, ",")+
+				`) AND status = 'pending' AND lease_until <= ?`,
+			args...); err != nil {
+			return fmt.Errorf("lease due: %w", err)
+		}
+
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("commit: %w", err)
+		}
+		claimed = batch
+		return nil
+	})
+	return claimed, err
+}
+
 // MarkDelivered removes a delivered target and, once an event has no deliveries
 // left in any state, removes the event so a fully delivered event leaves nothing
-// behind: in the happy path both tables end empty.
+// behind: in the happy path both tables end empty. A 0-row match (the row was
+// concurrently evicted) is a no-op success, not an error.
 func (s *Store) MarkDelivered(ctx context.Context, eventID string, deliveryID int64) error {
 	return s.do(ctx, func(ctx context.Context, db *sql.DB) error {
 		tx, err := db.BeginTx(ctx, nil)
@@ -220,19 +318,143 @@ func (s *Store) MarkDelivered(ctx context.Context, eventID string, deliveryID in
 	})
 }
 
-// MarkFailed records a delivery that exhausted its in-process retries. A single
-// UPDATE needs no transaction: the single-writer connection makes it atomic. The
-// row is left 'pending' (status untouched) this iteration; terminal dead-lettering
-// and accumulating attempts across passes arrive with the replay worker.
-func (s *Store) MarkFailed(ctx context.Context, deliveryID int64, attempts int, lastErr string) error {
+// Reschedule records a failed attempt that still has budget left: it stores the new
+// attempt count and error, advances next_attempt_at to the next due time, and clears
+// the lease so the row is eligible for a later scan. A single guarded UPDATE needs no
+// transaction — the single-writer connection makes it atomic. The status='pending'
+// guard prevents resurrecting a row another pass already parked, and a 0-row match
+// (the row was concurrently evicted) is a no-op success.
+func (s *Store) Reschedule(ctx context.Context, deliveryID int64, attempts int, lastErr string, nextAttemptAt int64) error {
 	return s.do(ctx, func(ctx context.Context, db *sql.DB) error {
 		if _, err := db.ExecContext(ctx,
-			`UPDATE deliveries SET attempts = ?, last_error = ? WHERE id = ?`,
-			attempts, lastErr, deliveryID); err != nil {
-			return fmt.Errorf("update delivery: %w", err)
+			`UPDATE deliveries SET attempts = ?, last_error = ?, next_attempt_at = ?, lease_until = 0
+			 WHERE id = ? AND status = 'pending'`,
+			attempts, lastErr, nextAttemptAt, deliveryID); err != nil {
+			return fmt.Errorf("reschedule delivery: %w", err)
 		}
 		return nil
 	})
+}
+
+// Park moves a delivery that exhausted its retry budget to status='dead': a terminal,
+// inspectable state. The row is kept, not deleted, so it pins its event body for a
+// later manual replay — dead-lettering is parking, not deletion. As with Reschedule,
+// the status='pending' guard makes it idempotent and a 0-row match is a no-op.
+func (s *Store) Park(ctx context.Context, deliveryID int64, attempts int, lastErr string) error {
+	return s.do(ctx, func(ctx context.Context, db *sql.DB) error {
+		if _, err := db.ExecContext(ctx,
+			`UPDATE deliveries SET status = 'dead', attempts = ?, last_error = ?, lease_until = 0
+			 WHERE id = ? AND status = 'pending'`,
+			attempts, lastErr, deliveryID); err != nil {
+			return fmt.Errorf("park delivery: %w", err)
+		}
+		return nil
+	})
+}
+
+// evictBatch is how many oldest events are deleted per pass while bringing the store
+// back under its size bound.
+const evictBatch = 16
+
+// EvictOldest enforces a logical-size bound, deleting whole events oldest-first
+// (their deliveries cascade via the foreign key) until the store is back under
+// maxBytes or empty, and returns the number of events evicted. Size is the logical
+// occupancy (page_count - freelist_count) * page_size, not the file size: SQLite
+// does not shrink the file on delete, so a file-size trigger would never fall once
+// the high-water mark is reached. A checkpoint runs first so WAL pages are counted,
+// gated by a cheap upper-bound pre-check so a store well under budget pays nothing.
+func (s *Store) EvictOldest(ctx context.Context, maxBytes int64) (int, error) {
+	var evicted int
+	err := s.do(ctx, func(ctx context.Context, db *sql.DB) error {
+		// page_count*page_size ignores the freelist, so if even that upper bound is
+		// under maxBytes the real occupancy certainly is — skip the heavier checkpoint.
+		var pageCount, pageSize int64
+		if err := db.QueryRowContext(ctx, `PRAGMA page_count`).Scan(&pageCount); err != nil {
+			return fmt.Errorf("page_count: %w", err)
+		}
+		if err := db.QueryRowContext(ctx, `PRAGMA page_size`).Scan(&pageSize); err != nil {
+			return fmt.Errorf("page_size: %w", err)
+		}
+		if pageCount*pageSize <= maxBytes {
+			return nil
+		}
+
+		if _, err := db.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+			return fmt.Errorf("checkpoint: %w", err)
+		}
+
+		for {
+			size, err := logicalSize(ctx, db)
+			if err != nil {
+				return err
+			}
+			if size <= maxBytes {
+				return nil
+			}
+
+			ids, err := oldestEventIDs(ctx, db, evictBatch)
+			if err != nil {
+				return err
+			}
+			if len(ids) == 0 {
+				return nil // nothing left to evict
+			}
+
+			placeholders := make([]string, len(ids))
+			args := make([]any, len(ids))
+			for i, id := range ids {
+				placeholders[i] = "?"
+				args[i] = id
+			}
+			if _, err := db.ExecContext(ctx,
+				`DELETE FROM events WHERE id IN (`+strings.Join(placeholders, ",")+`)`,
+				args...); err != nil {
+				return fmt.Errorf("delete events: %w", err)
+			}
+			evicted += len(ids)
+		}
+	})
+	return evicted, err
+}
+
+// logicalSize is the committed occupancy in bytes: allocated pages minus free pages,
+// times page size. Deleting rows frees pages onto the freelist immediately on this
+// connection, so the figure falls as the eviction loop deletes without needing a
+// fresh checkpoint each pass.
+func logicalSize(ctx context.Context, db *sql.DB) (int64, error) {
+	var pageCount, freelist, pageSize int64
+	if err := db.QueryRowContext(ctx, `PRAGMA page_count`).Scan(&pageCount); err != nil {
+		return 0, fmt.Errorf("page_count: %w", err)
+	}
+	if err := db.QueryRowContext(ctx, `PRAGMA freelist_count`).Scan(&freelist); err != nil {
+		return 0, fmt.Errorf("freelist_count: %w", err)
+	}
+	if err := db.QueryRowContext(ctx, `PRAGMA page_size`).Scan(&pageSize); err != nil {
+		return 0, fmt.Errorf("page_size: %w", err)
+	}
+	return (pageCount - freelist) * pageSize, nil
+}
+
+// oldestEventIDs returns up to limit event ids ordered by receipt time, oldest first.
+func oldestEventIDs(ctx context.Context, db *sql.DB, limit int) ([]string, error) {
+	rows, err := db.QueryContext(ctx, `SELECT id FROM events ORDER BY received_at ASC LIMIT ?`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("select oldest: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan oldest: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate oldest: %w", err)
+	}
+	return ids, nil
 }
 
 // Close stops the writer, checkpoints the WAL into the main database file so a

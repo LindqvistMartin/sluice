@@ -14,17 +14,19 @@ import (
 // recordingReporter is a Reporter that records terminal outcomes and signals each
 // one on done, so a test can wait for completion without sleeping.
 type recordingReporter struct {
-	mu        sync.Mutex
-	delivered map[int64]string // deliveryID -> eventID
-	failed    map[int64]int    // deliveryID -> attempts
-	done      chan struct{}
+	mu          sync.Mutex
+	delivered   map[int64]string // deliveryID -> eventID
+	rescheduled map[int64]int    // deliveryID -> attempts
+	parked      map[int64]int    // deliveryID -> attempts
+	done        chan struct{}
 }
 
 func newRecordingReporter(expected int) *recordingReporter {
 	return &recordingReporter{
-		delivered: make(map[int64]string),
-		failed:    make(map[int64]int),
-		done:      make(chan struct{}, expected),
+		delivered:   make(map[int64]string),
+		rescheduled: make(map[int64]int),
+		parked:      make(map[int64]int),
+		done:        make(chan struct{}, expected),
 	}
 }
 
@@ -36,9 +38,17 @@ func (r *recordingReporter) MarkDelivered(_ context.Context, eventID string, del
 	return nil
 }
 
-func (r *recordingReporter) MarkFailed(_ context.Context, deliveryID int64, attempts int, _ string) error {
+func (r *recordingReporter) Reschedule(_ context.Context, deliveryID int64, attempts int, _ string, _ int64) error {
 	r.mu.Lock()
-	r.failed[deliveryID] = attempts
+	r.rescheduled[deliveryID] = attempts
+	r.mu.Unlock()
+	r.done <- struct{}{}
+	return nil
+}
+
+func (r *recordingReporter) Park(_ context.Context, deliveryID int64, attempts int, _ string) error {
+	r.mu.Lock()
+	r.parked[deliveryID] = attempts
 	r.mu.Unlock()
 	r.done <- struct{}{}
 	return nil
@@ -50,16 +60,28 @@ func (r *recordingReporter) deliveredCount() int {
 	return len(r.delivered)
 }
 
-func (r *recordingReporter) failedCount() int {
+func (r *recordingReporter) rescheduledCount() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return len(r.failed)
+	return len(r.rescheduled)
 }
 
-func (r *recordingReporter) failedAttempts(id int64) int {
+func (r *recordingReporter) parkedCount() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.failed[id]
+	return len(r.parked)
+}
+
+func (r *recordingReporter) rescheduledAttempts(id int64) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.rescheduled[id]
+}
+
+func (r *recordingReporter) parkedAttempts(id int64) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.parked[id]
 }
 
 // waitFor blocks until n terminal outcomes are reported or the test deadline trips.
@@ -120,14 +142,15 @@ func TestFanout_MultiTarget_HappyPath(t *testing.T) {
 	if reporter.deliveredCount() != 2 {
 		t.Errorf("delivered = %d, want 2", reporter.deliveredCount())
 	}
-	if reporter.failedCount() != 0 {
-		t.Errorf("failed = %d, want 0", reporter.failedCount())
+	if n := reporter.rescheduledCount() + reporter.parkedCount(); n != 0 {
+		t.Errorf("non-delivered outcomes = %d, want 0", n)
 	}
 }
 
 // TestFanout_RedirectNotFollowed checks that a 3xx is treated as a retryable
 // failure, not a delivery: the client must not chase the Location (which would let
-// a target bounce the body to another host and report it delivered).
+// a target bounce the body to another host and report it delivered). With budget
+// remaining, the pass is reported as a reschedule.
 func TestFanout_RedirectNotFollowed(t *testing.T) {
 	var rootHits, finalHits atomic.Int32
 	mux := http.NewServeMux()
@@ -143,7 +166,7 @@ func TestFanout_RedirectNotFollowed(t *testing.T) {
 	defer srv.Close()
 
 	reporter := newRecordingReporter(1)
-	pool := NewPool(PoolConfig{Workers: 1, Reporter: reporter, BackoffBase: time.Millisecond, BackoffCap: 5 * time.Millisecond})
+	pool := NewPool(PoolConfig{Workers: 1, Reporter: reporter})
 	pool.Start()
 	defer pool.Close()
 
@@ -153,14 +176,14 @@ func TestFanout_RedirectNotFollowed(t *testing.T) {
 	if reporter.deliveredCount() != 0 {
 		t.Errorf("delivered = %d, want 0 (a 3xx must not count as delivered)", reporter.deliveredCount())
 	}
-	if reporter.failedCount() != 1 {
-		t.Errorf("failed = %d, want 1", reporter.failedCount())
+	if reporter.rescheduledCount() != 1 {
+		t.Errorf("rescheduled = %d, want 1", reporter.rescheduledCount())
 	}
 	if got := finalHits.Load(); got != 0 {
 		t.Errorf("redirect target hit %d times, want 0 (redirects must not be followed)", got)
 	}
-	if got := rootHits.Load(); got != 2 {
-		t.Errorf("target hit %d times, want 2 (RetryMax+1)", got)
+	if got := rootHits.Load(); got != 1 {
+		t.Errorf("target hit %d times, want 1 (one attempt per pass)", got)
 	}
 }
 

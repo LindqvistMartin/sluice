@@ -98,6 +98,11 @@ func TestParse_ValidationErrors(t *testing.T) {
 			want: `routes[1].path: duplicate route path "/a"`,
 		},
 		{
+			name: "duplicate target url in fanout",
+			yaml: "routes:\n  - path: /a\n    fanout:\n      - url: http://x/y\n      - url: http://x/y\n",
+			want: `routes[0].fanout[1].url: duplicate target url "http://x/y" in fanout`,
+		},
+		{
 			name: "empty fanout",
 			yaml: "routes:\n  - path: /a\n    fanout: []\n",
 			want: "routes[0].fanout: must list at least one target",

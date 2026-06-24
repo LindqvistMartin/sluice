@@ -26,12 +26,13 @@ const (
 // importing the store.
 type Reporter interface {
 	MarkDelivered(ctx context.Context, eventID string, deliveryID int64) error
-	MarkFailed(ctx context.Context, deliveryID int64, attempts int, lastErr string) error
+	Reschedule(ctx context.Context, deliveryID int64, attempts int, lastErr string, nextAttemptAt int64) error
+	Park(ctx context.Context, deliveryID int64, attempts int, lastErr string) error
 }
 
 // Delivery is one attempt to push one event's body to one target. It is the sole
-// input to the pool, produced identically by fresh ingest today and the replay
-// worker later, so the pool has one input contract regardless of source.
+// input to the pool, produced by the replay worker from a leased row, so the pool
+// has one input contract regardless of why the row became due.
 //
 // Body and Headers are read-only to the pool and may be shared across the several
 // deliveries of one event; workers must not mutate them.
@@ -43,6 +44,7 @@ type Delivery struct {
 	Headers    http.Header
 	Timeout    time.Duration
 	RetryMax   int
+	Attempts   int // attempts already recorded before this pass; 0 for a fresh row
 }
 
 // PoolConfig configures a Pool. The zero value of each field falls back to a sane
@@ -57,11 +59,12 @@ type PoolConfig struct {
 	Seed        uint64
 }
 
-// Pool fans deliveries out to downstream targets across a fixed set of workers,
-// retrying each target in process with exponential backoff up to its budget.
+// Pool fans deliveries out to downstream targets across a fixed set of workers. Each
+// submission is a single delivery attempt; the worker reports the outcome —
+// delivered, rescheduled for a later pass, or parked — and the replay worker drives
+// retries by re-submitting rows as they come due.
 type Pool struct {
 	in       chan Delivery
-	quit     chan struct{}
 	workers  int
 	client   *http.Client
 	reporter Reporter
@@ -121,7 +124,6 @@ func NewPool(cfg PoolConfig) *Pool {
 	}
 	return &Pool{
 		in:          make(chan Delivery, workers*4),
-		quit:        make(chan struct{}),
 		workers:     workers,
 		client:      client,
 		reporter:    cfg.Reporter,
@@ -153,47 +155,41 @@ func (p *Pool) Submit(d Delivery) {
 	p.in <- d
 }
 
-// Close stops accepting deliveries, abandons any pending backoff waits, and waits
-// for in-flight attempts to finish (each bounded by its per-target timeout).
-// Abandoned retries leave their rows pending in the store. Safe to call twice.
+// Close stops accepting deliveries and waits for in-flight attempts to finish (each
+// bounded by its per-target timeout), so every worker reports its outcome into the
+// store before the caller closes it. Safe to call twice.
 func (p *Pool) Close() {
 	p.closeOnce.Do(func() {
-		close(p.quit)
 		close(p.in)
 	})
 	p.wg.Wait()
 }
 
-// deliver attempts one target, retrying with backoff up to RetryMax, and reports
-// the terminal outcome. A shutdown signalled on quit abandons the retry wait and
-// leaves the row pending for later redelivery.
+// deliver makes one attempt at the target and reports the outcome: delivered on a
+// 2xx, otherwise rescheduled for a later pass or parked once the retry budget is
+// spent. Retries are durable — the replay worker re-submits a rescheduled row when
+// it next comes due — so a single submission is a single HTTP attempt. Outcomes are
+// reported on a fresh context, never a shutdown one: the store closes strictly after
+// the pool, so the final state is always recorded.
 func (p *Pool) deliver(d Delivery, rng *rand.Rand) {
-	var lastErr string
-	attempts := 0
-	for attempt := 0; attempt <= d.RetryMax; attempt++ {
-		if attempt > 0 {
-			select {
-			case <-time.After(Backoff(attempt-1, p.backoffBase, p.backoffCap, rng)):
-			case <-p.quit:
-				return
-			}
+	ok, errStr := p.attempt(d)
+	if ok {
+		if err := p.reporter.MarkDelivered(context.Background(), d.EventID, d.DeliveryID); err != nil {
+			p.log.Error("report delivered", "event", d.EventID, "delivery", d.DeliveryID, "err", err)
 		}
-		attempts = attempt + 1
-
-		ok, errStr := p.attempt(d)
-		if ok {
-			// Report on a fresh context, never a shutdown one: the store is closed
-			// strictly after the pool, so the final state is always recorded.
-			if err := p.reporter.MarkDelivered(context.Background(), d.EventID, d.DeliveryID); err != nil {
-				p.log.Error("report delivered", "event", d.EventID, "delivery", d.DeliveryID, "err", err)
-			}
-			return
-		}
-		lastErr = errStr
+		return
 	}
 
-	if err := p.reporter.MarkFailed(context.Background(), d.DeliveryID, attempts, lastErr); err != nil {
-		p.log.Error("report failed", "delivery", d.DeliveryID, "err", err)
+	attempts := d.Attempts + 1
+	switch outcome, nextAt := schedule(attempts, d.RetryMax, time.Now(), p.backoffBase, p.backoffCap, rng); outcome {
+	case OutcomePark:
+		if err := p.reporter.Park(context.Background(), d.DeliveryID, attempts, errStr); err != nil {
+			p.log.Error("report parked", "delivery", d.DeliveryID, "err", err)
+		}
+	default:
+		if err := p.reporter.Reschedule(context.Background(), d.DeliveryID, attempts, errStr, nextAt.UnixMilli()); err != nil {
+			p.log.Error("report rescheduled", "delivery", d.DeliveryID, "err", err)
+		}
 	}
 }
 
