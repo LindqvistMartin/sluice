@@ -17,6 +17,7 @@ import (
 	"github.com/LindqvistMartin/sluice/internal/deliver"
 	"github.com/LindqvistMartin/sluice/internal/dlq"
 	"github.com/LindqvistMartin/sluice/internal/ingest"
+	"github.com/LindqvistMartin/sluice/internal/metrics"
 	"github.com/LindqvistMartin/sluice/internal/observability"
 	"github.com/LindqvistMartin/sluice/internal/replay"
 	"github.com/LindqvistMartin/sluice/internal/route"
@@ -177,9 +178,54 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 		}
 	}()
 
+	// Metrics listen on a separate, opt-in address (empty disables it) so the
+	// exposition is never served on the public webhook port. metricsErr stays nil
+	// when disabled, which leaves its select case below inert.
+	var metricsSrv *http.Server
+	var metricsErr chan error
+	if cfg.MetricsListen != "" {
+		metricsErr = make(chan error, 1)
+		gather := func(ctx context.Context) (metrics.Snapshot, error) {
+			st, err := store.Stats(ctx)
+			if err != nil {
+				return metrics.Snapshot{}, err
+			}
+			return metrics.Snapshot{
+				Version: version,
+				Pending: st.Pending,
+				Dead:    st.Dead,
+				Evicted: worker.EvictedTotal(),
+			}, nil
+		}
+		mux := http.NewServeMux()
+		mux.Handle("/metrics", metrics.NewHandler(gather))
+		metricsSrv = &http.Server{
+			Addr:              cfg.MetricsListen,
+			Handler:           mux,
+			ReadHeaderTimeout: 5 * time.Second,
+			ReadTimeout:       15 * time.Second,
+			WriteTimeout:      15 * time.Second,
+			IdleTimeout:       60 * time.Second,
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			log.Info("metrics listening", "addr", metricsSrv.Addr)
+			if err := metricsSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				metricsErr <- err
+			}
+		}()
+	}
+
+	// A listener error or a shutdown signal ends the wait. Either way both servers are
+	// then shut down so their goroutines return before the deferred wg.Wait — shutting
+	// down only one would leave the other's goroutine blocked in ListenAndServe.
+	var runErr error
 	select {
 	case err := <-serverErr:
-		return fmt.Errorf("listener failed: %w", err)
+		runErr = fmt.Errorf("listener failed: %w", err)
+	case err := <-metricsErr:
+		runErr = fmt.Errorf("metrics listener failed: %w", err)
 	case <-runCtx.Done():
 		log.Info("shutdown signal received, draining")
 	}
@@ -188,10 +234,16 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	// claiming, drain in-flight deliveries, and checkpoint the WAL, in that order.
 	shutdownCtx, scancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer scancel()
-	if err := srv.Shutdown(shutdownCtx); err != nil {
-		return fmt.Errorf("graceful shutdown failed: %w", err)
+	if err := srv.Shutdown(shutdownCtx); err != nil && runErr == nil {
+		runErr = fmt.Errorf("graceful shutdown failed: %w", err)
+	}
+	if metricsSrv != nil {
+		_ = metricsSrv.Shutdown(shutdownCtx)
 	}
 
+	if runErr != nil {
+		return runErr
+	}
 	log.Info("sluice stopped")
 	return nil
 }

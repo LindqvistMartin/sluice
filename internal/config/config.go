@@ -11,10 +11,11 @@ import (
 
 // Config is the parsed and validated sluice configuration.
 type Config struct {
-	Listen string  `yaml:"listen"`
-	Limits Limits  `yaml:"limits"`
-	DLQ    DLQ     `yaml:"dlq"`
-	Routes []Route `yaml:"routes"`
+	Listen        string  `yaml:"listen"`
+	MetricsListen string  `yaml:"metrics_listen"` // empty disables the metrics endpoint
+	Limits        Limits  `yaml:"limits"`
+	DLQ           DLQ     `yaml:"dlq"`
+	Routes        []Route `yaml:"routes"`
 }
 
 // Limits holds the inbound guardrails applied to every request.

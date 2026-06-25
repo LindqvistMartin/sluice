@@ -39,6 +39,14 @@ func (c *Config) validate() error {
 	if _, _, err := net.SplitHostPort(c.Listen); err != nil {
 		add("listen", fmt.Sprintf("invalid listen address %q: %v", c.Listen, err))
 	}
+	if c.MetricsListen != "" {
+		if _, _, err := net.SplitHostPort(c.MetricsListen); err != nil {
+			add("metrics_listen", fmt.Sprintf("invalid metrics address %q: %v", c.MetricsListen, err))
+		}
+		if c.MetricsListen == c.Listen {
+			add("metrics_listen", "must differ from listen so metrics are not exposed on the webhook port")
+		}
+	}
 	if c.Limits.MaxBodyBytes <= 0 {
 		add("limits.max_body_bytes", "must be greater than 0")
 	}

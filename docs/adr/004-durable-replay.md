@@ -56,7 +56,8 @@ a row another worker is mid-delivery on, the terminal transitions (`MarkDelivere
 
 `sluice_dlq_evicted_total` is, for now, an `ERROR` log line plus an in-process counter
 the worker exposes; a metrics endpoint to publish it is left for a later change, as is
-the `sluice dlq retry` command for manually replaying parked rows.
+the `sluice dlq retry` command for manually replaying parked rows. Both are delivered
+in ADR-005.
 
 ## Consequences
 

@@ -147,6 +147,16 @@ func TestParse_ValidationErrors(t *testing.T) {
 			yaml: "listen: garbage\nroutes:\n  - path: /a\n    fanout:\n      - url: http://x/y\n",
 			want: "listen: invalid listen address",
 		},
+		{
+			name: "invalid metrics address",
+			yaml: "metrics_listen: garbage\nroutes:\n  - path: /a\n    fanout:\n      - url: http://x/y\n",
+			want: "metrics_listen: invalid metrics address",
+		},
+		{
+			name: "metrics listen equals listen",
+			yaml: "listen: 127.0.0.1:8080\nmetrics_listen: 127.0.0.1:8080\nroutes:\n  - path: /a\n    fanout:\n      - url: http://x/y\n",
+			want: "metrics_listen: must differ from listen",
+		},
 	}
 
 	for _, tt := range tests {
@@ -245,6 +255,31 @@ routes:
 	}
 	if tgt.Retry.Max != 5 {
 		t.Errorf("retry.max = %d, want default 5", tgt.Retry.Max)
+	}
+}
+
+func TestParse_MetricsListen(t *testing.T) {
+	cfg, err := parse(strings.NewReader(`
+metrics_listen: 127.0.0.1:9090
+routes:
+  - path: /hook
+    fanout:
+      - url: http://example.com/in
+`))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if cfg.MetricsListen != "127.0.0.1:9090" {
+		t.Errorf("metrics_listen = %q, want 127.0.0.1:9090", cfg.MetricsListen)
+	}
+
+	// Omitted means disabled: empty and not rejected.
+	def, err := parse(strings.NewReader("routes:\n  - path: /a\n    fanout:\n      - url: http://x/y\n"))
+	if err != nil {
+		t.Fatalf("parse default: %v", err)
+	}
+	if def.MetricsListen != "" {
+		t.Errorf("metrics_listen default = %q, want empty (disabled)", def.MetricsListen)
 	}
 }
 

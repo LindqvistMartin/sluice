@@ -140,8 +140,8 @@ func (w *Worker) Stop() {
 	<-w.done
 }
 
-// EvictedTotal is the number of events evicted since start. It backs the planned
-// sluice_dlq_evicted_total metric until a metrics endpoint exists.
+// EvictedTotal is the number of events evicted since start. It backs the
+// sluice_dlq_evicted_total metric.
 func (w *Worker) EvictedTotal() int64 {
 	return w.evicted.Load()
 }

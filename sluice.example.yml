@@ -3,6 +3,8 @@
 
 listen: :8080
 
+# metrics_listen: 127.0.0.1:9090   # opt-in Prometheus endpoint at /metrics; omit to disable. Must differ from listen.
+
 limits:
   max_body_bytes: 1048576        # 1 MiB
   per_ip_rate: 100/min           # burst equals the per-minute rate
