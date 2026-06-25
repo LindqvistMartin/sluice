@@ -41,6 +41,13 @@ func main() {
 }
 
 func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
+	// dlq is a verb, not a flag: operator subcommands over the queue file run as a
+	// one-shot process and never reach the daemon path below. Existing flags start
+	// with "-", so this dispatch leaves every other invocation unchanged.
+	if len(args) > 0 && args[0] == "dlq" {
+		return runDLQ(ctx, args[1:], stdout, stderr)
+	}
+
 	fs := flag.NewFlagSet("sluice", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	cfgPath := fs.String("c", "sluice.yml", "path to the configuration file")

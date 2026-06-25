@@ -567,3 +567,34 @@ func TestStore_EvictOldest_ToleratesLeasedInFlight(t *testing.T) {
 		t.Errorf("Park on evicted leased row = %v, want nil", err)
 	}
 }
+
+func TestStore_Stats_CountsByStatus(t *testing.T) {
+	s, _ := openTestStore(t)
+
+	// An empty store reports zeros, not NULL.
+	if st, err := s.Stats(context.Background()); err != nil || st.Pending != 0 || st.Dead != 0 {
+		t.Fatalf("empty stats = %+v (err %v), want {0 0}", st, err)
+	}
+
+	res, err := s.Persist(context.Background(), EventRecord{
+		Route: "/hook", Headers: http.Header{}, Body: []byte("x"),
+		TargetURLs: []string{"http://a.example", "http://b.example"},
+	})
+	if err != nil {
+		t.Fatalf("persist: %v", err)
+	}
+	if err := s.Park(context.Background(), res.DeliveryIDs[0], 6, "exhausted"); err != nil {
+		t.Fatalf("park: %v", err)
+	}
+
+	st, err := s.Stats(context.Background())
+	if err != nil {
+		t.Fatalf("stats: %v", err)
+	}
+	if st.Pending != 1 {
+		t.Errorf("pending = %d, want 1", st.Pending)
+	}
+	if st.Dead != 1 {
+		t.Errorf("dead = %d, want 1", st.Dead)
+	}
+}

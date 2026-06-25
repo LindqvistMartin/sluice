@@ -90,10 +90,11 @@ type Claimed struct {
 // goroutine that owns the connection, so write serialization is a property of the
 // architecture rather than a lock every caller must remember.
 type Store struct {
-	db   *sql.DB
-	ops  chan writeOp
-	done chan struct{}
-	log  *slog.Logger
+	db     *sql.DB
+	reader *sql.DB
+	ops    chan writeOp
+	done   chan struct{}
+	log    *slog.Logger
 
 	closeOnce sync.Once
 	closeErr  error
@@ -128,11 +129,20 @@ func Open(path string, log *slog.Logger) (*Store, error) {
 		return nil, fmt.Errorf("apply schema: %w", err)
 	}
 
+	// A separate connection for reads (Stats). WAL lets it run concurrently with the
+	// writer, so a metrics scrape never queues behind the delivery write path.
+	reader, err := sql.Open("sqlite", dsn(path))
+	if err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("open sqlite reader: %w", err)
+	}
+
 	s := &Store{
-		db:   db,
-		ops:  make(chan writeOp),
-		done: make(chan struct{}),
-		log:  log,
+		db:     db,
+		reader: reader,
+		ops:    make(chan writeOp),
+		done:   make(chan struct{}),
+		log:    log,
 	}
 	go s.writer()
 	return s, nil
@@ -352,6 +362,73 @@ func (s *Store) Park(ctx context.Context, deliveryID int64, attempts int, lastEr
 	})
 }
 
+// Stats is a point-in-time count of deliveries by status.
+type Stats struct {
+	Pending int64
+	Dead    int64
+}
+
+// Stats counts deliveries by status for the metrics endpoint. It reads on a separate
+// connection rather than the writer, so a scrape neither blocks nor is blocked by the
+// delivery write path; WAL keeps the count consistent with committed writes.
+func (s *Store) Stats(ctx context.Context) (Stats, error) {
+	return statsQuery(ctx, s.reader)
+}
+
+// statsQuery counts deliveries by status on db. It is connection-agnostic so the
+// daemon's read connection and the operator CLI's connection share it. COALESCE keeps
+// an empty table returning zeros rather than NULL.
+func statsQuery(ctx context.Context, db *sql.DB) (Stats, error) {
+	var s Stats
+	err := db.QueryRowContext(ctx, `
+		SELECT COALESCE(SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END), 0),
+		       COALESCE(SUM(CASE WHEN status = 'dead'    THEN 1 ELSE 0 END), 0)
+		FROM deliveries`).Scan(&s.Pending, &s.Dead)
+	if err != nil {
+		return Stats{}, fmt.Errorf("count by status: %w", err)
+	}
+	return s, nil
+}
+
+// DeadDelivery is a parked delivery as listed for an operator. It carries enough to
+// identify and triage the row but deliberately omits the event body, which can be
+// large or hold secrets.
+type DeadDelivery struct {
+	DeliveryID int64
+	EventID    string
+	Route      string
+	TargetURL  string
+	Attempts   int
+	LastError  string
+}
+
+// listDeadQuery returns every parked (dead) delivery on db, oldest first by id. It is
+// connection-agnostic for the same reason as statsQuery.
+func listDeadQuery(ctx context.Context, db *sql.DB) ([]DeadDelivery, error) {
+	rows, err := db.QueryContext(ctx, `
+		SELECT d.id, d.event_id, e.route, d.target_url, d.attempts, d.last_error
+		FROM deliveries d JOIN events e ON e.id = d.event_id
+		WHERE d.status = 'dead'
+		ORDER BY d.id`)
+	if err != nil {
+		return nil, fmt.Errorf("select dead: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var dead []DeadDelivery
+	for rows.Next() {
+		var d DeadDelivery
+		if err := rows.Scan(&d.DeliveryID, &d.EventID, &d.Route, &d.TargetURL, &d.Attempts, &d.LastError); err != nil {
+			return nil, fmt.Errorf("scan dead: %w", err)
+		}
+		dead = append(dead, d)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate dead: %w", err)
+	}
+	return dead, nil
+}
+
 // evictBatch is how many oldest events are deleted per pass while bringing the store
 // back under its size bound.
 const evictBatch = 16
@@ -465,11 +542,15 @@ func (s *Store) Close(ctx context.Context) error {
 		close(s.ops)
 		<-s.done // writer drains queued ops and exits before we touch the connection
 
+		// Close the reader first so no idle read connection blocks the truncating
+		// checkpoint, which reclaims the WAL only as the last connection standing.
+		readerErr := s.reader.Close()
+
 		var checkpointErr error
 		if _, err := s.db.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
 			checkpointErr = fmt.Errorf("wal checkpoint: %w", err)
 		}
-		s.closeErr = errors.Join(checkpointErr, s.db.Close())
+		s.closeErr = errors.Join(readerErr, checkpointErr, s.db.Close())
 	})
 	return s.closeErr
 }
