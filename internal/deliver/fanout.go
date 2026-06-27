@@ -30,6 +30,21 @@ type Reporter interface {
 	Park(ctx context.Context, deliveryID int64, attempts int, lastErr string) error
 }
 
+// Counter tallies per-target delivery outcomes for the metrics endpoint. A
+// *metrics.Counters satisfies it structurally, so the pool counts without importing
+// the metrics package, the same way Reporter keeps the store at arm's length.
+type Counter interface {
+	IncDelivered(route, target string)
+	IncFailed(route, target string)
+}
+
+// noopCounter is the default when metrics are disabled: the tallies only matter when
+// the exposition is served, so an unconfigured pool keeps its delivery path free of them.
+type noopCounter struct{}
+
+func (noopCounter) IncDelivered(string, string) {}
+func (noopCounter) IncFailed(string, string)    {}
+
 // Delivery is one attempt to push one event's body to one target. It is the sole
 // input to the pool, produced by the replay worker from a leased row, so the pool
 // has one input contract regardless of why the row became due.
@@ -39,6 +54,7 @@ type Reporter interface {
 type Delivery struct {
 	DeliveryID int64
 	EventID    string
+	Route      string // owning route path; with TargetURL it is the per-target metric key
 	TargetURL  string
 	Body       []byte
 	Headers    http.Header
@@ -53,6 +69,7 @@ type PoolConfig struct {
 	Workers     int
 	Client      *http.Client
 	Reporter    Reporter
+	Counter     Counter
 	BackoffBase time.Duration
 	BackoffCap  time.Duration
 	Logger      *slog.Logger
@@ -68,6 +85,7 @@ type Pool struct {
 	workers  int
 	client   *http.Client
 	reporter Reporter
+	counter  Counter
 
 	backoffBase time.Duration
 	backoffCap  time.Duration
@@ -122,11 +140,16 @@ func NewPool(cfg PoolConfig) *Pool {
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
 	}
+	counter := cfg.Counter
+	if counter == nil {
+		counter = noopCounter{}
+	}
 	return &Pool{
 		in:          make(chan Delivery, workers*4),
 		workers:     workers,
 		client:      client,
 		reporter:    cfg.Reporter,
+		counter:     counter,
 		backoffBase: base,
 		backoffCap:  bcap,
 		log:         log,
@@ -174,12 +197,16 @@ func (p *Pool) Close() {
 func (p *Pool) deliver(d Delivery, rng *rand.Rand) {
 	ok, errStr := p.attempt(d)
 	if ok {
+		p.counter.IncDelivered(d.Route, d.TargetURL)
 		if err := p.reporter.MarkDelivered(context.Background(), d.EventID, d.DeliveryID); err != nil {
 			p.log.Error("report delivered", "event", d.EventID, "delivery", d.DeliveryID, "err", err)
 		}
 		return
 	}
 
+	// Count every failed attempt, not just the terminal park, so the metric reflects
+	// retry pressure: a row that fails twice then succeeds is two failures, one delivery.
+	p.counter.IncFailed(d.Route, d.TargetURL)
 	attempts := d.Attempts + 1
 	switch outcome, nextAt := schedule(attempts, d.RetryMax, time.Now(), p.backoffBase, p.backoffCap, rng); outcome {
 	case OutcomePark:

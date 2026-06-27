@@ -231,3 +231,114 @@ func TestFanout_StripsSensitiveHeaders(t *testing.T) {
 		t.Errorf("X-Sluice-Event-Id = %q, want evt_headers", got)
 	}
 }
+
+// recordingCounter is a Counter that tallies outcomes per (route, target) so a test
+// can assert the pool counted a delivery or a failed attempt against the right key.
+type recordingCounter struct {
+	mu        sync.Mutex
+	delivered map[string]int
+	failed    map[string]int
+}
+
+func newRecordingCounter() *recordingCounter {
+	return &recordingCounter{delivered: make(map[string]int), failed: make(map[string]int)}
+}
+
+func (c *recordingCounter) IncDelivered(route, target string) {
+	c.mu.Lock()
+	c.delivered[route+"\x00"+target]++
+	c.mu.Unlock()
+}
+
+func (c *recordingCounter) IncFailed(route, target string) {
+	c.mu.Lock()
+	c.failed[route+"\x00"+target]++
+	c.mu.Unlock()
+}
+
+func (c *recordingCounter) deliveredCount(route, target string) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.delivered[route+"\x00"+target]
+}
+
+func (c *recordingCounter) failedCount(route, target string) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.failed[route+"\x00"+target]
+}
+
+// TestFanout_CountsPerTargetOutcomes checks the pool tallies a 2xx as one delivery and
+// a non-2xx as one failed attempt, each keyed by the delivery's own (route, target).
+func TestFanout_CountsPerTargetOutcomes(t *testing.T) {
+	okSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer okSrv.Close()
+	failSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer failSrv.Close()
+
+	reporter := newRecordingReporter(2)
+	counter := newRecordingCounter()
+	pool := NewPool(PoolConfig{Workers: 2, Reporter: reporter, Counter: counter})
+	pool.Start()
+	defer pool.Close()
+
+	pool.Submit(Delivery{DeliveryID: 1, EventID: "evt_ok", Route: "/gh", TargetURL: okSrv.URL, Body: []byte("x"), Timeout: 2 * time.Second, RetryMax: 3})
+	pool.Submit(Delivery{DeliveryID: 2, EventID: "evt_fail", Route: "/gl", TargetURL: failSrv.URL, Body: []byte("x"), Timeout: 2 * time.Second, RetryMax: 3})
+
+	reporter.waitFor(t, 2)
+
+	if got := counter.deliveredCount("/gh", okSrv.URL); got != 1 {
+		t.Errorf("delivered count for (/gh, ok target) = %d, want 1", got)
+	}
+	if got := counter.failedCount("/gl", failSrv.URL); got != 1 {
+		t.Errorf("failed count for (/gl, failing target) = %d, want 1", got)
+	}
+	// A success is not also a failure, and the route is part of the key: the failing
+	// target's tally must not land under the delivered target's (route, URL).
+	if got := counter.failedCount("/gh", okSrv.URL); got != 0 {
+		t.Errorf("failed count for the delivered target = %d, want 0", got)
+	}
+	if got := counter.deliveredCount("/gl", failSrv.URL); got != 0 {
+		t.Errorf("delivered count for the failing target = %d, want 0", got)
+	}
+}
+
+// TestFanout_CountsAccumulateAcrossAttempts is the ADR's headline case: a target that
+// fails twice before succeeding tallies two failures and one delivery. A single worker
+// with one in-flight submission at a time keeps the target's 500, 500, 200 sequence
+// deterministic, standing in for the replay worker re-submitting a rescheduled row.
+func TestFanout_CountsAccumulateAcrossAttempts(t *testing.T) {
+	var hits atomic.Int32
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if hits.Add(1) <= 2 {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer target.Close()
+
+	reporter := newRecordingReporter(3)
+	counter := newRecordingCounter()
+	pool := NewPool(PoolConfig{Workers: 1, Reporter: reporter, Counter: counter})
+	pool.Start()
+	defer pool.Close()
+
+	// RetryMax 5 keeps the two failures as reschedules, not parks; wait for each pass's
+	// outcome before submitting the next so the attempts hit the target in order.
+	for attempt := range 3 {
+		pool.Submit(Delivery{DeliveryID: 1, EventID: "evt_retry", Route: "/r", TargetURL: target.URL, Body: []byte("x"), Timeout: 2 * time.Second, RetryMax: 5, Attempts: attempt})
+		reporter.waitFor(t, 1)
+	}
+
+	if got := counter.deliveredCount("/r", target.URL); got != 1 {
+		t.Errorf("delivered = %d, want 1", got)
+	}
+	if got := counter.failedCount("/r", target.URL); got != 2 {
+		t.Errorf("failed = %d, want 2 (every failed attempt counts)", got)
+	}
+}

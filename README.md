@@ -26,11 +26,12 @@ Most incident tools expose one inbound webhook URL. Once a second system needs t
 - Deliveries that exhaust their budget are parked, not dropped, and the DLQ is bounded by size with oldest-first eviction
 - `sluice dlq list` and `sluice dlq retry` to inspect parked deliveries and replay them, with the daemon up or down
 - An optional Prometheus metrics endpoint, off by default and never on the inbound port (`metrics_listen`)
+- Per-target delivery and failure counters on that endpoint, labelled by route and target
 - Structured logging, config-as-code, and a `-t` config check
 
 ## Planned
 
-- Per-target delivery and failure counters on the metrics endpoint
+- Per-status-code retry classification — today any non-2xx is retried the same way
 
 One small static binary in a ~15 MB image, with no message broker to run alongside it. Design notes are in the [ADRs](docs/adr).
 

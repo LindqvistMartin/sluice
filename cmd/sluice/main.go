@@ -101,11 +101,24 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 	// recorded and the WAL is checkpointed.
 	defer func() { _ = store.Close(context.Background()) }()
 
-	pool := deliver.NewPool(deliver.PoolConfig{
+	// Per-target delivery counters back the optional metrics endpoint, so build the
+	// registry only when metrics are enabled and otherwise leave the delivery path
+	// uninstrumented. Assign PoolConfig.Counter only when non-nil: a typed-nil
+	// *metrics.Counters in the interface would defeat NewPool's no-op fallback and
+	// panic on the first delivery.
+	var counters *metrics.Counters
+	if cfg.MetricsListen != "" {
+		counters = metrics.NewCounters()
+	}
+	poolCfg := deliver.PoolConfig{
 		Client:   deliver.NewClient(),
 		Reporter: store,
 		Logger:   log,
-	})
+	}
+	if counters != nil {
+		poolCfg.Counter = counters
+	}
+	pool := deliver.NewPool(poolCfg)
 	pool.Start()
 	defer pool.Close()
 
@@ -195,6 +208,7 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer) error {
 				Pending: st.Pending,
 				Dead:    st.Dead,
 				Evicted: worker.EvictedTotal(),
+				Targets: counters.Snapshot(),
 			}, nil
 		}
 		mux := http.NewServeMux()
@@ -314,6 +328,7 @@ func (tr targetResolver) Resolve(route, targetURL string) (time.Duration, int, b
 // and worker consume, without those packages importing one another.
 var (
 	_ deliver.Reporter      = (*dlq.Store)(nil)
+	_ deliver.Counter       = (*metrics.Counters)(nil)
 	_ replay.Store          = (*dlq.Store)(nil)
 	_ replay.Submitter      = (*deliver.Pool)(nil)
 	_ replay.TargetResolver = targetResolver{}

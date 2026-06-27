@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -109,6 +110,148 @@ func TestRun_MetricsEndpoint(t *testing.T) {
 	_ = resp.Body.Close()
 	if strings.Contains(string(ib), "sluice_dlq_") {
 		t.Error("inbound port served metrics; want them only on metrics_listen")
+	}
+}
+
+func TestRun_MetricsEndpoint_PerTarget(t *testing.T) {
+	// A real target so the delivery actually succeeds and the per-target counter ticks.
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer target.Close()
+
+	addrs := freeAddrs(t, 2)
+	inbound, metricsAddr := addrs[0], addrs[1]
+
+	dir := t.TempDir()
+	dbPath := filepath.ToSlash(filepath.Join(dir, "dlq.db"))
+	cfg := "listen: " + inbound + "\n" +
+		"metrics_listen: " + metricsAddr + "\n" +
+		"dlq:\n  path: '" + dbPath + "'\n" +
+		"routes:\n  - path: /hook\n    fanout:\n      - url: " + target.URL + "\n"
+	cfgPath := filepath.Join(dir, "sluice.yml")
+	if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		var out, errb bytes.Buffer
+		done <- run(ctx, []string{"-c", cfgPath}, &out, &errb)
+	}()
+	defer func() {
+		cancel()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Errorf("run returned %v", err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Error("run did not return after cancel")
+		}
+	}()
+
+	// Wait for the inbound listener, then POST one webhook to /hook.
+	postDeadline := time.After(10 * time.Second)
+	for {
+		resp, err := http.Post("http://"+inbound+"/hook", "application/json", strings.NewReader(`{"x":1}`))
+		if err == nil {
+			_ = resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				break
+			}
+		}
+		select {
+		case <-postDeadline:
+			t.Fatal("inbound never accepted the webhook")
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+
+	// Delivery is async, so poll until the per-target line shows the delivery landed.
+	wantLine := `sluice_deliveries_total{route="/hook",target="` + target.URL + `"} 1`
+	deadline := time.After(10 * time.Second)
+	for {
+		if resp, err := http.Get("http://" + metricsAddr + "/metrics"); err == nil {
+			b, _ := io.ReadAll(resp.Body)
+			_ = resp.Body.Close()
+			if strings.Contains(string(b), wantLine+"\n") {
+				return
+			}
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("metrics never showed %q", wantLine)
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+}
+
+func TestRun_DeliversWithMetricsDisabled(t *testing.T) {
+	// The default config sets no metrics_listen, so the pool is handed the no-op
+	// counter. Boxing a nil *metrics.Counters into the interface instead would panic on
+	// the first delivery in this default configuration; a hit here proves it does not.
+	got := make(chan struct{}, 1)
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		select {
+		case got <- struct{}{}:
+		default:
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer target.Close()
+
+	inbound := freeAddrs(t, 1)[0]
+	dir := t.TempDir()
+	dbPath := filepath.ToSlash(filepath.Join(dir, "dlq.db"))
+	cfg := "listen: " + inbound + "\n" +
+		"dlq:\n  path: '" + dbPath + "'\n" +
+		"routes:\n  - path: /hook\n    fanout:\n      - url: " + target.URL + "\n"
+	cfgPath := filepath.Join(dir, "sluice.yml")
+	if err := os.WriteFile(cfgPath, []byte(cfg), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		var out, errb bytes.Buffer
+		done <- run(ctx, []string{"-c", cfgPath}, &out, &errb)
+	}()
+	defer func() {
+		cancel()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Errorf("run returned %v", err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Error("run did not return after cancel")
+		}
+	}()
+
+	// POST one webhook once the inbound listener is up, then wait for the delivery.
+	postDeadline := time.After(10 * time.Second)
+	for {
+		resp, err := http.Post("http://"+inbound+"/hook", "application/json", strings.NewReader(`{"x":1}`))
+		if err == nil {
+			_ = resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				break
+			}
+		}
+		select {
+		case <-postDeadline:
+			t.Fatal("inbound never accepted the webhook")
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+
+	select {
+	case <-got:
+	case <-time.After(10 * time.Second):
+		t.Fatal("target never received the delivery with metrics disabled")
 	}
 }
 

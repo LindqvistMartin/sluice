@@ -217,6 +217,7 @@ func (w *Worker) replay() {
 			w.pool.Submit(deliver.Delivery{
 				DeliveryID: c.DeliveryID,
 				EventID:    c.EventID,
+				Route:      c.Route,
 				TargetURL:  c.TargetURL,
 				Body:       c.Body,
 				Headers:    c.Headers,
