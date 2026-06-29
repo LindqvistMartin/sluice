@@ -19,10 +19,10 @@ import (
 // schemaDDL is the durable store: events holds each payload once, deliveries holds
 // one row per target with a foreign key that cascades on delete. A row is 'pending'
 // until it is leased and driven to a terminal state — deleted on success, or 'dead'
-// once its retry budget is exhausted. lease_until keeps an in-flight row from being
-// claimed twice and lets a crashed worker's row recover once the lease expires;
-// next_attempt_at schedules the next due time. The full column set was created up
-// front so this needs no migration.
+// once it is parked, whether its retry budget was exhausted or its failure was
+// permanent. lease_until keeps an in-flight row from being claimed twice and lets a
+// crashed worker's row recover once the lease expires; next_attempt_at schedules the
+// next due time. The full column set was created up front so this needs no migration.
 const schemaDDL = `
 CREATE TABLE IF NOT EXISTS events (
     id           TEXT    PRIMARY KEY,
@@ -346,10 +346,11 @@ func (s *Store) Reschedule(ctx context.Context, deliveryID int64, attempts int, 
 	})
 }
 
-// Park moves a delivery that exhausted its retry budget to status='dead': a terminal,
-// inspectable state. The row is kept, not deleted, so it pins its event body for a
-// later manual replay — dead-lettering is parking, not deletion. As with Reschedule,
-// the status='pending' guard makes it idempotent and a 0-row match is a no-op.
+// Park moves a delivery to status='dead', a terminal and inspectable state, once it
+// will not be retried — its retry budget is spent or its failure is permanent. The row
+// is kept, not deleted, so it pins its event body for a later manual replay —
+// dead-lettering is parking, not deletion. As with Reschedule, the status='pending'
+// guard makes it idempotent and a 0-row match is a no-op.
 func (s *Store) Park(ctx context.Context, deliveryID int64, attempts int, lastErr string) error {
 	return s.do(ctx, func(ctx context.Context, db *sql.DB) error {
 		if _, err := db.ExecContext(ctx,

@@ -24,6 +24,7 @@ Most incident tools expose one inbound webhook URL. Once a second system needs t
 - Fan-out to many targets, each delivered with its own timeout, retries, and backoff
 - Durable retries: failed deliveries are rescheduled on disk and survive a restart, leased so a crashed worker's in-flight work recovers
 - Deliveries that exhaust their budget are parked, not dropped, and the DLQ is bounded by size with oldest-first eviction
+- Failed deliveries are classified by response: 5xx, 429, 408, and transport errors are retried; other 4xx and 3xx are parked at once rather than spending the retry budget
 - `sluice dlq list` and `sluice dlq retry` to inspect parked deliveries and replay them, with the daemon up or down
 - An optional Prometheus metrics endpoint, off by default and never on the inbound port (`metrics_listen`)
 - Per-target delivery and failure counters on that endpoint, labelled by route and target
@@ -31,7 +32,7 @@ Most incident tools expose one inbound webhook URL. Once a second system needs t
 
 ## Planned
 
-- Per-status-code retry classification — today any non-2xx is retried the same way
+- Honouring a target's `Retry-After` on 429 and 503 to pace the next retry, instead of the standard backoff
 
 One small static binary in a ~15 MB image, with no message broker to run alongside it. Design notes are in the [ADRs](docs/adr).
 

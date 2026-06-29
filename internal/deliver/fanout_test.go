@@ -147,10 +147,10 @@ func TestFanout_MultiTarget_HappyPath(t *testing.T) {
 	}
 }
 
-// TestFanout_RedirectNotFollowed checks that a 3xx is treated as a retryable
-// failure, not a delivery: the client must not chase the Location (which would let
-// a target bounce the body to another host and report it delivered). With budget
-// remaining, the pass is reported as a reschedule.
+// TestFanout_RedirectNotFollowed checks that a 3xx is treated as a permanent failure,
+// not a delivery: the client must not chase the Location (which would let a target
+// bounce the body to another host and report it delivered). Since the redirect is not
+// followed, the row parks on the first failure even with retry budget remaining.
 func TestFanout_RedirectNotFollowed(t *testing.T) {
 	var rootHits, finalHits atomic.Int32
 	mux := http.NewServeMux()
@@ -176,14 +176,104 @@ func TestFanout_RedirectNotFollowed(t *testing.T) {
 	if reporter.deliveredCount() != 0 {
 		t.Errorf("delivered = %d, want 0 (a 3xx must not count as delivered)", reporter.deliveredCount())
 	}
-	if reporter.rescheduledCount() != 1 {
-		t.Errorf("rescheduled = %d, want 1", reporter.rescheduledCount())
+	if reporter.parkedCount() != 1 {
+		t.Errorf("parked = %d, want 1", reporter.parkedCount())
+	}
+	if got := reporter.parkedAttempts(5); got != 1 {
+		t.Errorf("parked attempts = %d, want 1 (a 3xx parks on the first failure)", got)
 	}
 	if got := finalHits.Load(); got != 0 {
 		t.Errorf("redirect target hit %d times, want 0 (redirects must not be followed)", got)
 	}
 	if got := rootHits.Load(); got != 1 {
 		t.Errorf("target hit %d times, want 1 (one attempt per pass)", got)
+	}
+}
+
+// TestFanout_PermanentStatusParksImmediately checks that a status the target will keep
+// returning parks on the first failure instead of spending the retry budget: a 404 with
+// budget to spare must be parked, not rescheduled, and hit exactly once.
+func TestFanout_PermanentStatusParksImmediately(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	reporter := newRecordingReporter(1)
+	pool := NewPool(PoolConfig{Workers: 1, Reporter: reporter})
+	pool.Start()
+	defer pool.Close()
+
+	pool.Submit(Delivery{DeliveryID: 7, EventID: "evt_permanent", TargetURL: srv.URL, Body: []byte("x"), Timeout: 2 * time.Second, RetryMax: 3})
+	reporter.waitFor(t, 1)
+
+	if reporter.parkedCount() != 1 {
+		t.Errorf("parked = %d, want 1 (a 404 parks at once)", reporter.parkedCount())
+	}
+	if got := reporter.parkedAttempts(7); got != 1 {
+		t.Errorf("parked attempts = %d, want 1", got)
+	}
+	if reporter.rescheduledCount() != 0 {
+		t.Errorf("rescheduled = %d, want 0 (budget must not be spent on a permanent failure)", reporter.rescheduledCount())
+	}
+	if got := hits.Load(); got != 1 {
+		t.Errorf("target hit %d times, want 1 (a permanent failure is not retried)", got)
+	}
+}
+
+// TestFanout_RetryableStatusReschedules checks the other side of classification: a 503
+// with budget remaining is retried, reported as a reschedule rather than a park.
+func TestFanout_RetryableStatusReschedules(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	reporter := newRecordingReporter(1)
+	pool := NewPool(PoolConfig{Workers: 1, Reporter: reporter})
+	pool.Start()
+	defer pool.Close()
+
+	pool.Submit(Delivery{DeliveryID: 8, EventID: "evt_retryable", TargetURL: srv.URL, Body: []byte("x"), Timeout: 2 * time.Second, RetryMax: 3})
+	reporter.waitFor(t, 1)
+
+	if reporter.rescheduledCount() != 1 {
+		t.Errorf("rescheduled = %d, want 1 (a 503 with budget retries)", reporter.rescheduledCount())
+	}
+	if got := reporter.rescheduledAttempts(8); got != 1 {
+		t.Errorf("rescheduled attempts = %d, want 1", got)
+	}
+	if reporter.parkedCount() != 0 {
+		t.Errorf("parked = %d, want 0", reporter.parkedCount())
+	}
+}
+
+// TestFanout_TransportErrorReschedules checks that a delivery to an unreachable target —
+// a transport error with no HTTP status, the one failure that does not pass through
+// classify — is retryable: with budget remaining it is rescheduled, not parked, so a
+// target that is briefly down gets another pass.
+func TestFanout_TransportErrorReschedules(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	target := srv.URL
+	srv.Close() // nothing listens on target now, so client.Do returns a transport error
+
+	reporter := newRecordingReporter(1)
+	pool := NewPool(PoolConfig{Workers: 1, Reporter: reporter})
+	pool.Start()
+	defer pool.Close()
+
+	pool.Submit(Delivery{DeliveryID: 9, EventID: "evt_transport", TargetURL: target, Body: []byte("x"), Timeout: 2 * time.Second, RetryMax: 3})
+	reporter.waitFor(t, 1)
+
+	if reporter.rescheduledCount() != 1 {
+		t.Errorf("rescheduled = %d, want 1 (a transport error is retryable)", reporter.rescheduledCount())
+	}
+	if reporter.parkedCount() != 0 {
+		t.Errorf("parked = %d, want 0", reporter.parkedCount())
 	}
 }
 

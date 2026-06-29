@@ -103,8 +103,8 @@ func NewClient() *http.Client {
 	return &http.Client{
 		// Do not follow redirects: a 3xx from a target is not a delivery, and an
 		// attacker-controlled Location would let a target bounce the body and the
-		// X-Sluice-Event-Id header to an unintended host. A 3xx then falls through
-		// to the retryable-failure path like any other non-2xx.
+		// X-Sluice-Event-Id header to an unintended host. Since we will not follow it,
+		// a 3xx is a permanent failure and parks at once rather than retrying.
 		CheckRedirect: func(*http.Request, []*http.Request) error {
 			return http.ErrUseLastResponse
 		},
@@ -188,15 +188,16 @@ func (p *Pool) Close() {
 	p.wg.Wait()
 }
 
-// deliver makes one attempt at the target and reports the outcome: delivered on a
-// 2xx, otherwise rescheduled for a later pass or parked once the retry budget is
-// spent. Retries are durable — the replay worker re-submits a rescheduled row when
-// it next comes due — so a single submission is a single HTTP attempt. Outcomes are
-// reported on a fresh context, never a shutdown one: the store closes strictly after
-// the pool, so the final state is always recorded.
+// deliver makes one attempt at the target and reports the outcome: delivered on a 2xx,
+// rescheduled for a later pass on a retryable failure with budget left, or parked —
+// either because the budget is spent or because the failure is permanent, a status the
+// target will keep returning (classified by attempt). Retries are durable — the replay
+// worker re-submits a rescheduled row when it next comes due — so a single submission is
+// a single HTTP attempt. Outcomes are reported on a fresh context, never a shutdown one:
+// the store closes strictly after the pool, so the final state is always recorded.
 func (p *Pool) deliver(d Delivery, rng *rand.Rand) {
-	ok, errStr := p.attempt(d)
-	if ok {
+	result, errStr := p.attempt(d)
+	if result == attemptDelivered {
 		p.counter.IncDelivered(d.Route, d.TargetURL)
 		if err := p.reporter.MarkDelivered(context.Background(), d.EventID, d.DeliveryID); err != nil {
 			p.log.Error("report delivered", "event", d.EventID, "delivery", d.DeliveryID, "err", err)
@@ -208,11 +209,18 @@ func (p *Pool) deliver(d Delivery, rng *rand.Rand) {
 	// retry pressure: a row that fails twice then succeeds is two failures, one delivery.
 	p.counter.IncFailed(d.Route, d.TargetURL)
 	attempts := d.Attempts + 1
+
+	// A permanent failure cannot be fixed by waiting — the target rejects the request the
+	// same way on every pass — so it parks now instead of spending the rest of the retry
+	// budget. Parked, not dropped: the row stays in the DLQ to read.
+	if result == attemptPermanent {
+		p.park(d.DeliveryID, attempts, errStr)
+		return
+	}
+
 	switch outcome, nextAt := schedule(attempts, d.RetryMax, time.Now(), p.backoffBase, p.backoffCap, rng); outcome {
 	case OutcomePark:
-		if err := p.reporter.Park(context.Background(), d.DeliveryID, attempts, errStr); err != nil {
-			p.log.Error("report parked", "delivery", d.DeliveryID, "err", err)
-		}
+		p.park(d.DeliveryID, attempts, errStr)
 	default:
 		if err := p.reporter.Reschedule(context.Background(), d.DeliveryID, attempts, errStr, nextAt.UnixMilli()); err != nil {
 			p.log.Error("report rescheduled", "delivery", d.DeliveryID, "err", err)
@@ -220,31 +228,42 @@ func (p *Pool) deliver(d Delivery, rng *rand.Rand) {
 	}
 }
 
-// attempt performs a single POST to the target, bounded by the target's timeout.
-// It reports success only on a 2xx; any other status or a transport error is a
-// retryable failure (per-status-code classification is a later refinement).
-func (p *Pool) attempt(d Delivery) (ok bool, errStr string) {
+// park marks a delivery dead — the terminal state for a row that will not be retried,
+// whether its budget is spent or its status is permanently rejecting. The row is parked,
+// not deleted, so an operator can still read why it died.
+func (p *Pool) park(deliveryID int64, attempts int, lastErr string) {
+	if err := p.reporter.Park(context.Background(), deliveryID, attempts, lastErr); err != nil {
+		p.log.Error("report parked", "delivery", deliveryID, "err", err)
+	}
+}
+
+// attempt performs a single POST to the target, bounded by the target's timeout, and
+// classifies the result. A 2xx is delivered; any other status is a retryable or permanent
+// failure (see classify). A transport error carries no status and is treated as
+// retryable — the next pass may reach a target that has recovered.
+func (p *Pool) attempt(d Delivery) (attemptOutcome, string) {
 	ctx, cancel := context.WithTimeout(context.Background(), d.Timeout)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, d.TargetURL, bytes.NewReader(d.Body))
 	if err != nil {
-		return false, fmt.Sprintf("build request: %v", err)
+		return attemptRetryable, fmt.Sprintf("build request: %v", err)
 	}
 	copyHeaders(req.Header, d.Headers)
 	req.Header.Set("X-Sluice-Event-Id", d.EventID)
 
 	resp, err := p.client.Do(req)
 	if err != nil {
-		return false, err.Error()
+		return attemptRetryable, err.Error()
 	}
 	defer func() { _ = resp.Body.Close() }()
 	_, _ = io.Copy(io.Discard, resp.Body) // drain so the connection can be reused
 
-	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		return true, ""
+	result := classify(resp.StatusCode)
+	if result == attemptDelivered {
+		return attemptDelivered, ""
 	}
-	return false, fmt.Sprintf("status %d", resp.StatusCode)
+	return result, fmt.Sprintf("status %d", resp.StatusCode)
 }
 
 // hopByHop are connection-scoped headers that belong to the inbound hop, not the

@@ -149,7 +149,7 @@ func writeExposition(b *bytes.Buffer, s Snapshot) {
 	b.WriteString("# TYPE sluice_dlq_pending gauge\n")
 	_, _ = fmt.Fprintf(b, "sluice_dlq_pending %d\n", s.Pending)
 
-	b.WriteString("# HELP sluice_dlq_dead Deliveries parked after exhausting their retry budget.\n")
+	b.WriteString("# HELP sluice_dlq_dead Deliveries parked as dead, by retry-budget exhaustion or a permanent failure.\n")
 	b.WriteString("# TYPE sluice_dlq_dead gauge\n")
 	_, _ = fmt.Fprintf(b, "sluice_dlq_dead %d\n", s.Dead)
 
