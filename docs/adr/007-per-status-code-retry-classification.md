@@ -2,7 +2,7 @@
 
 ## Status
 
-Accepted.
+Accepted. The `Retry-After` deferral noted under Decision is resolved by ADR-008.
 
 ## Context
 

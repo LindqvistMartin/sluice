@@ -18,6 +18,14 @@ const (
 	DefaultBackoffBase = 100 * time.Millisecond
 	DefaultBackoffCap  = 30 * time.Second
 
+	// DefaultMaxRetryAfter caps how far an honoured Retry-After can defer a retry. The
+	// header is the target's number, not ours, so it is trusted further than the backoff
+	// — but only this far, which is what stops a hostile or fat-fingered value
+	// (Retry-After: 86400) from parking a row for a day. It is deliberately larger than
+	// BackoffCap: a retry is durable, so the row waits on disk rather than holding a
+	// worker, and real 429/503 windows run to minutes, not the backoff's seconds.
+	DefaultMaxRetryAfter = 5 * time.Minute
+
 	defaultWorkers = 8
 )
 
@@ -66,14 +74,15 @@ type Delivery struct {
 // PoolConfig configures a Pool. The zero value of each field falls back to a sane
 // default, so only Reporter is required for production use.
 type PoolConfig struct {
-	Workers     int
-	Client      *http.Client
-	Reporter    Reporter
-	Counter     Counter
-	BackoffBase time.Duration
-	BackoffCap  time.Duration
-	Logger      *slog.Logger
-	Seed        uint64
+	Workers       int
+	Client        *http.Client
+	Reporter      Reporter
+	Counter       Counter
+	BackoffBase   time.Duration
+	BackoffCap    time.Duration
+	MaxRetryAfter time.Duration
+	Logger        *slog.Logger
+	Seed          uint64
 }
 
 // Pool fans deliveries out to downstream targets across a fixed set of workers. Each
@@ -87,10 +96,11 @@ type Pool struct {
 	reporter Reporter
 	counter  Counter
 
-	backoffBase time.Duration
-	backoffCap  time.Duration
-	log         *slog.Logger
-	seed        uint64
+	backoffBase   time.Duration
+	backoffCap    time.Duration
+	maxRetryAfter time.Duration
+	log           *slog.Logger
+	seed          uint64
 
 	wg        sync.WaitGroup
 	closeOnce sync.Once
@@ -136,6 +146,10 @@ func NewPool(cfg PoolConfig) *Pool {
 	if bcap <= 0 {
 		bcap = DefaultBackoffCap
 	}
+	maxRA := cfg.MaxRetryAfter
+	if maxRA <= 0 {
+		maxRA = DefaultMaxRetryAfter
+	}
 	log := cfg.Logger
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
@@ -145,15 +159,16 @@ func NewPool(cfg PoolConfig) *Pool {
 		counter = noopCounter{}
 	}
 	return &Pool{
-		in:          make(chan Delivery, workers*4),
-		workers:     workers,
-		client:      client,
-		reporter:    cfg.Reporter,
-		counter:     counter,
-		backoffBase: base,
-		backoffCap:  bcap,
-		log:         log,
-		seed:        cfg.Seed,
+		in:            make(chan Delivery, workers*4),
+		workers:       workers,
+		client:        client,
+		reporter:      cfg.Reporter,
+		counter:       counter,
+		backoffBase:   base,
+		backoffCap:    bcap,
+		maxRetryAfter: maxRA,
+		log:           log,
+		seed:          cfg.Seed,
 	}
 }
 
@@ -196,7 +211,7 @@ func (p *Pool) Close() {
 // a single HTTP attempt. Outcomes are reported on a fresh context, never a shutdown one:
 // the store closes strictly after the pool, so the final state is always recorded.
 func (p *Pool) deliver(d Delivery, rng *rand.Rand) {
-	result, errStr := p.attempt(d)
+	result, retryAfter, errStr := p.attempt(d)
 	if result == attemptDelivered {
 		p.counter.IncDelivered(d.Route, d.TargetURL)
 		if err := p.reporter.MarkDelivered(context.Background(), d.EventID, d.DeliveryID); err != nil {
@@ -218,7 +233,14 @@ func (p *Pool) deliver(d Delivery, rng *rand.Rand) {
 		return
 	}
 
-	switch outcome, nextAt := schedule(attempts, d.RetryMax, time.Now(), p.backoffBase, p.backoffCap, rng); outcome {
+	// An honoured Retry-After paces this one retry in place of the jittered backoff,
+	// bounded by maxRetryAfter so a target cannot defer the row indefinitely. noRetryHint
+	// is negative and so never trips the clamp, leaving the backoff in charge.
+	override := retryAfter
+	if override > p.maxRetryAfter {
+		override = p.maxRetryAfter
+	}
+	switch outcome, nextAt := schedule(attempts, d.RetryMax, time.Now(), p.backoffBase, p.backoffCap, rng, override); outcome {
 	case OutcomePark:
 		p.park(d.DeliveryID, attempts, errStr)
 	default:
@@ -240,30 +262,42 @@ func (p *Pool) park(deliveryID int64, attempts int, lastErr string) {
 // attempt performs a single POST to the target, bounded by the target's timeout, and
 // classifies the result. A 2xx is delivered; any other status is a retryable or permanent
 // failure (see classify). A transport error carries no status and is treated as
-// retryable — the next pass may reach a target that has recovered.
-func (p *Pool) attempt(d Delivery) (attemptOutcome, string) {
+// retryable — the next pass may reach a target that has recovered. The second return is the
+// next-retry delay the target asked for: a parsed Retry-After when the status is one that
+// carries it (429, 503), or noRetryHint otherwise, which leaves the caller's backoff in
+// charge.
+func (p *Pool) attempt(d Delivery) (attemptOutcome, time.Duration, string) {
 	ctx, cancel := context.WithTimeout(context.Background(), d.Timeout)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, d.TargetURL, bytes.NewReader(d.Body))
 	if err != nil {
-		return attemptRetryable, fmt.Sprintf("build request: %v", err)
+		return attemptRetryable, noRetryHint, fmt.Sprintf("build request: %v", err)
 	}
 	copyHeaders(req.Header, d.Headers)
 	req.Header.Set("X-Sluice-Event-Id", d.EventID)
 
 	resp, err := p.client.Do(req)
 	if err != nil {
-		return attemptRetryable, err.Error()
+		return attemptRetryable, noRetryHint, err.Error()
 	}
 	defer func() { _ = resp.Body.Close() }()
 	_, _ = io.Copy(io.Discard, resp.Body) // drain so the connection can be reused
 
 	result := classify(resp.StatusCode)
 	if result == attemptDelivered {
-		return attemptDelivered, ""
+		return attemptDelivered, noRetryHint, ""
 	}
-	return result, fmt.Sprintf("status %d", resp.StatusCode)
+
+	// Only 429 and 503 carry a Retry-After worth obeying; for every other retryable status
+	// the hint stays absent and the scheduler keeps its backoff.
+	hint := noRetryHint
+	if result == attemptRetryable && honoursRetryAfter(resp.StatusCode) {
+		if ra, ok := parseRetryAfter(resp.Header, time.Now()); ok {
+			hint = ra
+		}
+	}
+	return result, hint, fmt.Sprintf("status %d", resp.StatusCode)
 }
 
 // hopByHop are connection-scoped headers that belong to the inbound hop, not the

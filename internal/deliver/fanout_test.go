@@ -17,6 +17,7 @@ type recordingReporter struct {
 	mu          sync.Mutex
 	delivered   map[int64]string // deliveryID -> eventID
 	rescheduled map[int64]int    // deliveryID -> attempts
+	nextAttempt map[int64]int64  // deliveryID -> next-attempt time (UnixMilli)
 	parked      map[int64]int    // deliveryID -> attempts
 	done        chan struct{}
 }
@@ -25,6 +26,7 @@ func newRecordingReporter(expected int) *recordingReporter {
 	return &recordingReporter{
 		delivered:   make(map[int64]string),
 		rescheduled: make(map[int64]int),
+		nextAttempt: make(map[int64]int64),
 		parked:      make(map[int64]int),
 		done:        make(chan struct{}, expected),
 	}
@@ -38,9 +40,10 @@ func (r *recordingReporter) MarkDelivered(_ context.Context, eventID string, del
 	return nil
 }
 
-func (r *recordingReporter) Reschedule(_ context.Context, deliveryID int64, attempts int, _ string, _ int64) error {
+func (r *recordingReporter) Reschedule(_ context.Context, deliveryID int64, attempts int, _ string, nextAttemptAt int64) error {
 	r.mu.Lock()
 	r.rescheduled[deliveryID] = attempts
+	r.nextAttempt[deliveryID] = nextAttemptAt
 	r.mu.Unlock()
 	r.done <- struct{}{}
 	return nil
@@ -76,6 +79,14 @@ func (r *recordingReporter) rescheduledAttempts(id int64) int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.rescheduled[id]
+}
+
+// rescheduledNextAt returns the next-attempt time the pool reported for a rescheduled
+// delivery, as a UnixMilli timestamp, so a test can assert how a retry was paced.
+func (r *recordingReporter) rescheduledNextAt(id int64) int64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.nextAttempt[id]
 }
 
 func (r *recordingReporter) parkedAttempts(id int64) int {
